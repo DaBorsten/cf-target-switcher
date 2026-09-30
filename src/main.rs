@@ -74,6 +74,28 @@ fn read_config() -> CfConfig {
         .unwrap_or_default()
 }
 
+/// Turns cf's auth-related failures into a short, actionable message.
+fn login_hint(msg: &str) -> Option<String> {
+    let m = msg.to_lowercase();
+    let reason = if m.contains("no api endpoint set") {
+        "no Cloud Foundry API endpoint set"
+    } else if m.contains("not logged in") {
+        "not logged in to Cloud Foundry"
+    } else if m.contains("token expired")
+        || m.contains("was revoked")
+        || m.contains("log back in")
+        || m.contains("invalid_token")
+        || m.contains("invalid auth token")
+    {
+        "your Cloud Foundry session has expired"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{reason}.\n\nLog in first, then run cf-ts again:\n  cf login          (or: cf login --sso)"
+    ))
+}
+
 fn cf_curl(path: &str) -> Result<Page> {
     let out = Command::new("cf")
         .args(["curl", path])
@@ -81,16 +103,19 @@ fn cf_curl(path: &str) -> Result<Page> {
         .context("failed to start cf – is the cf CLI on your PATH?")?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
-        bail!(
-            "cf curl {path} failed (are you logged in?):\n{}{}",
-            stdout.trim(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        let msg = [stdout.trim(), String::from_utf8_lossy(&out.stderr).trim()]
+            .iter()
+            .filter(|s| !s.is_empty() && **s != "FAILED")
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!(login_hint(&msg).unwrap_or_else(|| format!("cf curl {path} failed:\n{msg}")));
     }
     let value: serde_json::Value = serde_json::from_str(&stdout)
         .with_context(|| format!("unexpected response from cf curl {path}:\n{stdout}"))?;
     if let Some(errors) = value.get("errors") {
-        bail!("API error for {path}: {errors}");
+        let errors = errors.to_string();
+        bail!(login_hint(&errors).unwrap_or_else(|| format!("API error for {path}: {errors}")));
     }
     Ok(serde_json::from_value(value)?)
 }
@@ -169,6 +194,13 @@ fn main() {
         }
         return;
     }
+
+    // dialoguer hides the cursor while a picker is open; Ctrl+C would exit
+    // before it gets shown again, leaving the terminal without a cursor.
+    let _ = ctrlc::set_handler(|| {
+        let _ = console::Term::stderr().show_cursor();
+        exit(130);
+    });
 
     match run() {
         Ok(code) => exit(code),
