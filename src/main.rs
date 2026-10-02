@@ -96,23 +96,57 @@ fn login_hint(msg: &str) -> Option<String> {
     ))
 }
 
+/// stdout and stderr of a cf call, without cf's bare "FAILED" line.
+fn combined_output(out: &std::process::Output) -> String {
+    [
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty() && s != "FAILED")
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+/// Fails with a login hint if cf has no usable token.
+fn check_login() -> Result<()> {
+    let out = Command::new("cf")
+        .arg("oauth-token")
+        .output()
+        .context("failed to start cf – is the cf CLI on your PATH?")?;
+    if !out.status.success() {
+        let msg = combined_output(&out);
+        bail!(login_hint(&msg).unwrap_or_else(|| format!(
+            "cf has no valid session:\n{msg}\n\nLog in first, then run cf-ts again:\n  cf login          (or: cf login --sso)"
+        )));
+    }
+    Ok(())
+}
+
 fn cf_curl(path: &str) -> Result<Page> {
     let out = Command::new("cf")
         .args(["curl", path])
         .output()
         .context("failed to start cf – is the cf CLI on your PATH?")?;
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let msg = combined_output(&out);
     if !out.status.success() {
-        let msg = [stdout.trim(), String::from_utf8_lossy(&out.stderr).trim()]
-            .iter()
-            .filter(|s| !s.is_empty() && **s != "FAILED")
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n");
         bail!(login_hint(&msg).unwrap_or_else(|| format!("cf curl {path} failed:\n{msg}")));
     }
-    let value: serde_json::Value = serde_json::from_str(&stdout)
-        .with_context(|| format!("unexpected response from cf curl {path}:\n{stdout}"))?;
+    let value: serde_json::Value = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(hint) = login_hint(&msg) {
+                bail!(hint);
+            }
+            // Some cf versions exit 0 with an empty body when the session is
+            // gone; ask cf directly whether we still have a valid token.
+            if stdout.trim().is_empty() {
+                check_login()?;
+            }
+            bail!("unexpected response from cf curl {path}: {e}\n{msg}");
+        }
+    };
     if let Some(errors) = value.get("errors") {
         let errors = errors.to_string();
         bail!(login_hint(&errors).unwrap_or_else(|| format!("API error for {path}: {errors}")));
