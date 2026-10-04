@@ -84,10 +84,10 @@ cf-ts
 ```
 
 1. Pick an org (type to filter, arrow keys to move, Enter to select).
-2. Pick a space. If the org has exactly one space, it is selected automatically.
+2. Pick a space.
 3. `cf target` is run with your choice.
 
-Press Esc to cancel without changing the target.
+Press Esc in the space list to go back to the orgs, for example after just looking which spaces an org has. Press Esc in the org list to cancel without changing the target.
 
 ```text
 Options:
@@ -95,11 +95,70 @@ Options:
   -V, --version  Print version
 ```
 
+### Favorites
+
+Org names can be hard to tell apart. In the org list, press Tab on an org and type a name of your own for it. Favorites are listed first and show your name in front of the org name. Typing filters on both.
+
+```text
+? Org › type to filter
+❯ ★ Shared (example-shared)
+  ★ Team A Test (example-team-a-test)
+  ───────────────────────────────────
+    example-team-a-dev
+    example-team-b-dev
+
+   Tab  name selected entry   Esc  quit
+```
+
+Press Tab on a favorite again to rename it, or clear the name to remove it. Esc leaves it as it was. Favorites belong to the API endpoint you are logged in to, so an org with the same name on another endpoint is not affected. The names are stored in `$CF_HOME/.cf/cf-ts.json`, by endpoint and org name, so you can also edit the file by hand:
+
+```json
+{
+  "https://api.cf.example.com": {
+    "orgs": {
+      "example-shared": "Shared",
+      "example-team-a-test": "Team A Test"
+    }
+  }
+}
+```
+
+### Saved targets
+
+If you keep going back to the same org and space, save the two together. Pick the org, then press Tab on the space and type a name. Saved targets are listed above the orgs, and Enter on one switches to its org and space at once, without asking for the space.
+
+```text
+? Org › type to filter
+❯ ◆ Team B dev (example-team-b-dev / dev)
+  ───────────────────────────────────────
+  ★ Shared (example-shared)
+  ★ Team A Test (example-team-a-test)
+  ───────────────────────────────────────
+    example-team-a-dev
+    example-team-b-dev
+
+   Tab  name selected entry   Esc  quit
+```
+
+Press Tab on a saved target, in either list, to rename it, or clear the name to remove it. Targets are stored next to the favorites in `cf-ts.json`, by org name and space name:
+
+```json
+{
+  "https://api.cf.example.com": {
+    "targets": {
+      "example-team-b-dev": {
+        "dev": "Team B dev"
+      }
+    }
+  }
+}
+```
+
 `cf-ts` reads the current target from `$CF_HOME/.cf/config.json` (falling back to your home directory), the same location the cf CLI uses.
 
 ## Security
 
-`cf-ts` never sees your password and makes no network requests of its own. It only runs `cf curl` and `cf target`, so authentication stays with the cf CLI. From `config.json` it only uses the GUIDs of the current org and space. The tokens in that file are neither stored, logged nor sent anywhere. Org and space names are passed to `cf` as plain arguments, never through a shell.
+`cf-ts` never sees your password and makes no network requests of its own. It only runs `cf curl` and `cf target`, plus `cf oauth-token` to check for a session when `cf curl` returns nothing, so authentication stays with the cf CLI. The token that prints is not used. From `config.json` it only uses the API endpoint and the names and GUIDs of the current org and space. The tokens in that file are neither stored, logged nor sent anywhere. The only file it writes is `cf-ts.json` with your favorites. Org and space names are passed to `cf` as plain arguments, never through a shell.
 
 ## Releasing
 
