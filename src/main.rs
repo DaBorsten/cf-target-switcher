@@ -12,8 +12,9 @@ use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::{exit, Command};
+use std::process::{exit, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -22,9 +23,11 @@ const USAGE: &str = "\
 Interactively switch Cloud Foundry org and space.
 
 Usage: cf-ts [OPTIONS]
+       cf-ts update
 
 Lists your orgs and spaces via `cf curl`, lets you fuzzy-pick one and
-runs `cf target -o ORG -s SPACE`. Requires the cf CLI and an active login.
+runs `cf target -o ORG -s SPACE`. Requires the cf CLI; without an active
+login, it logs you in first, with a one-time passcode (SSO).
 
 Press Tab on an org to make it a favorite and give it a name of your own.
 Favorites are listed first, as \"★ NAME (ORG)\".
@@ -35,9 +38,13 @@ a name of your own. Saved targets are listed above the orgs, as
 
 Press Esc in the space list to go back to the orgs, and Esc there to quit.
 
+Commands:
+  update          Update cf-ts to the latest release, if there is a newer one
+
 Options:
-  -h, --help     Print help
-  -V, --version  Print version";
+  -p, --password  Log in with email and password instead of SSO
+  -h, --help      Print help
+  -V, --version   Print version";
 
 #[derive(Deserialize)]
 struct Page {
@@ -67,6 +74,9 @@ struct CfConfig {
     /// API endpoint, e.g. `https://api.cf.example.com`.
     #[serde(rename = "Target", default)]
     api: String,
+    /// Login server, e.g. `https://login.cf.example.com`.
+    #[serde(rename = "AuthorizationEndpoint", default)]
+    login: String,
     #[serde(rename = "OrganizationFields", default)]
     org: Target,
     #[serde(rename = "SpaceFields", default)]
@@ -142,26 +152,51 @@ fn save_favorites(favorites: &mut AllFavorites) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-/// Turns cf's auth-related failures into a short, actionable message.
-fn login_hint(msg: &str) -> Option<String> {
+/// cf has no usable session. `run` answers this with `cf login`; where it
+/// cannot, the message says how to log in.
+#[derive(Debug)]
+struct NeedsLogin(String);
+
+impl std::fmt::Display for NeedsLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{}\n\nLog in first, then run cf-ts again:\n  cf login          (or: cf login --sso)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NeedsLogin {}
+
+/// Turns cf's auth-related failures into a short reason.
+fn login_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_lowercase();
-    let reason = if m.contains("no api endpoint set") {
-        "no Cloud Foundry API endpoint set"
+    if m.contains("no api endpoint set") {
+        Some("No Cloud Foundry API endpoint set.")
     } else if m.contains("not logged in") {
-        "not logged in to Cloud Foundry"
+        Some("Not logged in to Cloud Foundry.")
     } else if m.contains("token expired")
         || m.contains("was revoked")
         || m.contains("log back in")
         || m.contains("invalid_token")
         || m.contains("invalid auth token")
+        || m.contains("cf-notauthenticated")
+        || m.contains("authentication error")
     {
-        "your Cloud Foundry session has expired"
+        Some("Your Cloud Foundry session has expired.")
     } else {
-        return None;
-    };
-    Some(format!(
-        "{reason}.\n\nLog in first, then run cf-ts again:\n  cf login          (or: cf login --sso)"
-    ))
+        None
+    }
+}
+
+/// The error for a failed cf call: `NeedsLogin` if `msg` is an auth failure,
+/// otherwise `other`.
+fn cf_error(msg: &str, other: impl FnOnce() -> String) -> anyhow::Error {
+    match login_hint(msg) {
+        Some(reason) => NeedsLogin(reason.to_string()).into(),
+        None => anyhow::anyhow!(other()),
+    }
 }
 
 /// stdout and stderr of a cf call, without cf's bare "FAILED" line.
@@ -176,6 +211,31 @@ fn combined_output(out: &std::process::Output) -> String {
     .join("\n")
 }
 
+/// The reason a `cf login` / `cf auth` failed, without the prompts, endpoint
+/// info and "Not logged in" lines cf prints around it.
+fn login_failure(msg: &str) -> String {
+    let lines: Vec<&str> = msg
+        .lines()
+        .map(|line| match line.starts_with("Temporary Authentication Code") {
+            // The prompt has no newline, so the next output follows it.
+            true => line.rsplit_once("): ").map_or("", |(_, rest)| rest),
+            false => line,
+        })
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !["API endpoint:", "API version:", "Not logged in", "Authenticating", "FAILED"]
+                    .iter()
+                    .any(|noise| line.starts_with(noise))
+        })
+        .collect();
+    if lines.is_empty() {
+        msg.to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 /// Fails with a login hint if cf has no usable token.
 fn check_login() -> Result<()> {
     let out = Command::new("cf")
@@ -184,11 +244,145 @@ fn check_login() -> Result<()> {
         .context("failed to start cf – is the cf CLI on your PATH?")?;
     if !out.status.success() {
         let msg = combined_output(&out);
-        bail!(login_hint(&msg).unwrap_or_else(|| format!(
-            "cf has no valid session:\n{msg}\n\nLog in first, then run cf-ts again:\n  cf login          (or: cf login --sso)"
-        )));
+        let reason = match login_hint(&msg) {
+            Some(reason) => reason.to_string(),
+            None => format!("cf has no valid session:\n{msg}"),
+        };
+        bail!(NeedsLogin(reason));
     }
     Ok(())
+}
+
+/// An org, and a space if there is one, that `cf login` can be told to
+/// target: what was targeted before, otherwise a saved target or favorite.
+fn known_target<'a>(
+    config: &'a CfConfig,
+    favorites: Option<&'a Favorites>,
+) -> Option<(&'a str, Option<&'a str>)> {
+    if !config.org.name.is_empty() {
+        let space = Some(config.space.name.as_str()).filter(|s| !s.is_empty());
+        return Some((&config.org.name, space));
+    }
+    let favorites = favorites?;
+    let saved = favorites.targets.iter().find_map(|(org, spaces)| {
+        let space = spaces.keys().next()?;
+        Some((org.as_str(), Some(space.as_str())))
+    });
+    saved.or_else(|| favorites.orgs.keys().next().map(|org| (org.as_str(), None)))
+}
+
+/// Runs `cf login` in the terminal. With a `target` passed along, cf does
+/// not ask for an org, and with a space in it not for a space either: the
+/// picker does that.
+fn cf_login(sso: bool, target: Option<(&str, Option<&str>)>) -> Result<()> {
+    let mut args = vec!["login"];
+    if sso {
+        args.push("--sso");
+    }
+    if let Some((org, space)) = target {
+        args.extend(["-o", org]);
+        if let Some(space) = space {
+            args.extend(["-s", space]);
+        }
+    }
+    // Whether it worked shows when the orgs are fetched again.
+    Command::new("cf")
+        .args(&args)
+        .status()
+        .context("failed to start cf – is the cf CLI on your PATH?")?;
+    eprintln!();
+    Ok(())
+}
+
+/// Logs in without leaving cf-ts: with a one-time passcode (SSO), or with
+/// `password` by email and password.
+fn login(
+    config: &CfConfig,
+    favorites: Option<&Favorites>,
+    reason: &NeedsLogin,
+    password: bool,
+) -> Result<()> {
+    eprintln!("{} Logging in…\n", reason.0);
+    let target = known_target(config, favorites);
+    // `cf auth` needs an API endpoint; `cf login` asks for one.
+    if config.api.is_empty() {
+        return cf_login(!password, target);
+    }
+    let theme = ColorfulTheme::default();
+    const TRIES: usize = 3;
+    if !password {
+        // A one-time passcode is something only `cf login` can take, and it
+        // goes on to ask for an org and space. It can run out of sight, with
+        // the passcode as the answer to its first question and an empty line
+        // to the others: that targets nothing.
+        if config.login.is_empty() {
+            return cf_login(true, target);
+        }
+        eprintln!("API endpoint: {}", config.api);
+        eprintln!("Get a passcode at {}/passcode", config.login);
+        for attempt in 1..=TRIES {
+            let passcode = dialoguer::Password::with_theme(&theme)
+                .with_prompt("Temporary Authentication Code")
+                .interact()?;
+            let mut cf = Command::new("cf")
+                .args(["login", "--sso"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("failed to start cf – is the cf CLI on your PATH?")?;
+            // Through stdin: arguments are visible to other processes.
+            // Dropped right after, so cf never waits for more. A failed
+            // write means cf is gone already, and its output says why.
+            if let Some(mut stdin) = cf.stdin.take() {
+                let _ = stdin.write_all(format!("{}\n\n\n", passcode.trim()).as_bytes());
+            }
+            let out = cf.wait_with_output()?;
+            // cf may exit non-zero over the unanswered questions although
+            // the login itself worked.
+            if out.status.success() || check_login().is_ok() {
+                eprintln!();
+                return Ok(());
+            }
+            let msg = login_failure(&combined_output(&out));
+            if attempt == TRIES {
+                bail!("login failed:\n{msg}");
+            }
+            eprintln!("{msg}\n");
+        }
+        unreachable!()
+    }
+    eprintln!("API endpoint: {}", config.api);
+
+    // Asked for here and handed to `cf auth`, which, unlike `cf login`, does
+    // not go on to ask for an org and space.
+    for attempt in 1..=TRIES {
+        let email: String = dialoguer::Input::with_theme(&theme)
+            .with_prompt("Email")
+            .interact_text()?;
+        let email = email.trim();
+        let password = dialoguer::Password::with_theme(&theme)
+            .with_prompt("Password")
+            .interact()?;
+
+        // Through the environment: arguments are visible to other processes.
+        let out = Command::new("cf")
+            .arg("auth")
+            .env("CF_USERNAME", email)
+            .env("CF_PASSWORD", password)
+            .output()
+            .context("failed to start cf – is the cf CLI on your PATH?")?;
+        if out.status.success() {
+            eprintln!();
+            return Ok(());
+        }
+        let msg = login_failure(&combined_output(&out));
+        if attempt == TRIES {
+            bail!("login failed:\n{msg}");
+        }
+        eprintln!("{msg}\n");
+    }
+    unreachable!()
 }
 
 fn cf_curl(path: &str) -> Result<Page> {
@@ -199,13 +393,13 @@ fn cf_curl(path: &str) -> Result<Page> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let msg = combined_output(&out);
     if !out.status.success() {
-        bail!(login_hint(&msg).unwrap_or_else(|| format!("cf curl {path} failed:\n{msg}")));
+        return Err(cf_error(&msg, || format!("cf curl {path} failed:\n{msg}")));
     }
     let value: serde_json::Value = match serde_json::from_str(&stdout) {
         Ok(v) => v,
         Err(e) => {
-            if let Some(hint) = login_hint(&msg) {
-                bail!(hint);
+            if let Some(reason) = login_hint(&msg) {
+                bail!(NeedsLogin(reason.to_string()));
             }
             // Some cf versions exit 0 with an empty body when the session is
             // gone; ask cf directly whether we still have a valid token.
@@ -217,7 +411,7 @@ fn cf_curl(path: &str) -> Result<Page> {
     };
     if let Some(errors) = value.get("errors") {
         let errors = errors.to_string();
-        bail!(login_hint(&errors).unwrap_or_else(|| format!("API error for {path}: {errors}")));
+        return Err(cf_error(&errors, || format!("API error for {path}: {errors}")));
     }
     Ok(serde_json::from_value(value)?)
 }
@@ -309,6 +503,33 @@ fn close_picker() {
     }
     let _ = term.show_cursor();
 }
+
+/// The terminal's settings as cf-ts found them, for Ctrl+C to put back.
+#[cfg(unix)]
+static TERMIOS: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+fn save_terminal() {
+    let mut termios = std::mem::MaybeUninit::uninit();
+    // Fails if stdin is not a terminal: nothing to put back then.
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, termios.as_mut_ptr()) } == 0 {
+        let _ = TERMIOS.set(unsafe { termios.assume_init() });
+    }
+}
+
+#[cfg(unix)]
+fn restore_terminal() {
+    if let Some(termios) = TERMIOS.get() {
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, termios) };
+    }
+}
+
+// Windows prompts for a password without changing the console mode.
+#[cfg(not(unix))]
+fn save_terminal() {}
+
+#[cfg(not(unix))]
+fn restore_terminal() {}
 
 /// Leaves the alternate screen for good and shows what was picked.
 fn finish_picker() -> Result<()> {
@@ -835,11 +1056,30 @@ fn target(org: &str, space: Option<&str>) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
-fn run() -> Result<i32> {
-    let config = read_config();
+fn run(password: bool) -> Result<i32> {
+    const ORGS: &str = "/v3/organizations?order_by=name&per_page=5000";
+
+    let mut config = read_config();
     let mut all = load_favorites()?;
 
-    let mut orgs = list_all("/v3/organizations?order_by=name&per_page=5000")?;
+    let mut orgs = match list_all(ORGS) {
+        // Without a session, log in right here instead of sending the user
+        // off to do it, unless there is nobody to answer cf's questions.
+        Err(e) if std::io::stdin().is_terminal() => {
+            let reason = e.downcast::<NeedsLogin>()?;
+            login(&config, all.get(&config.api), &reason, password)?;
+            // `cf login` can change the target. `cf auth` clears it: keep
+            // the one from before, so that the picker still starts on it.
+            let fresh = read_config();
+            if fresh.org.guid.is_empty() {
+                config.api = fresh.api;
+            } else {
+                config = fresh;
+            }
+            list_all(ORGS)?
+        }
+        orgs => orgs?,
+    };
     if orgs.is_empty() {
         bail!("no orgs found");
     }
@@ -891,28 +1131,145 @@ fn run() -> Result<i32> {
     }
 }
 
+const REPO: &str = "DaBorsten/cf-target-switcher";
+
+/// The numbers of a version like `0.2.1`, or of its tag, `v0.2.1`.
+fn parse_version(version: &str) -> Option<Vec<u64>> {
+    version
+        .strip_prefix('v')
+        .unwrap_or(version)
+        .split('.')
+        .map(|n| n.parse().ok())
+        .collect()
+}
+
+/// Tag of the latest release, like `v0.2.1`.
+fn latest_tag() -> Result<String> {
+    // GitHub redirects from here to the release's own page, which, unlike
+    // its API, has no rate limit. curl is what the installer needs anyway.
+    let out = Command::new("curl")
+        .args(["--proto", "=https", "--tlsv1.2", "-fsSLI", "-w", "%{url_effective}", "-o"])
+        .arg(if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .arg(format!("https://github.com/{REPO}/releases/latest"))
+        .output()
+        .context("failed to start curl – is it on your PATH?")?;
+    if !out.status.success() {
+        bail!(
+            "could not look up the latest release:\n{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let url = String::from_utf8_lossy(&out.stdout);
+    match url.trim().rsplit_once("/releases/tag/") {
+        Some((_, tag)) => Ok(tag.to_string()),
+        None => bail!("no release found at {}", url.trim()),
+    }
+}
+
+/// The command that downloads the install script at `url` and runs it.
+#[cfg(not(windows))]
+fn installer(url: &str) -> Command {
+    let mut cmd = Command::new("sh");
+    // Not piped straight into sh: a failed download would count as success.
+    let script =
+        r#"script=$(curl --proto '=https' --tlsv1.2 -fsSL "$1") && printf '%s\n' "$script" | sh"#;
+    cmd.args(["-c", script, "sh", url]);
+    cmd
+}
+
+#[cfg(windows)]
+fn installer(url: &str) -> Command {
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-Command", "irm $env:CF_TS_INSTALL_SCRIPT | iex"])
+        .env("CF_TS_INSTALL_SCRIPT", url)
+        // Started from PowerShell 7, it would inherit that one's modules
+        // and not find its own, like the one with `Get-FileHash`.
+        .env_remove("PSModulePath");
+    cmd
+}
+
+/// Where `update` moves the running cf-ts out of the way on Windows.
+fn old_exe() -> Option<PathBuf> {
+    Some(std::env::current_exe().ok()?.with_extension("exe.old"))
+}
+
+/// Installs the latest release over this cf-ts, if it is a newer one.
+fn update() -> Result<i32> {
+    let current = env!("CARGO_PKG_VERSION");
+    let tag = latest_tag()?;
+    // Also makes sure the tag is nothing but a version before it is used.
+    let latest = parse_version(&tag).with_context(|| format!("unexpected release tag {tag}"))?;
+    if Some(&latest) <= parse_version(current).as_ref() {
+        println!("cf-ts {current} is up to date.");
+        return Ok(0);
+    }
+    println!("Updating cf-ts {current} to {}…", tag.trim_start_matches('v'));
+
+    let exe = std::env::current_exe().context("cannot find the cf-ts executable")?;
+    let dir = exe.parent().context("cannot find the cf-ts directory")?;
+    // Windows does not let a running program be overwritten, only renamed.
+    // What is left behind is removed when cf-ts runs the next time.
+    let old = old_exe().context("cannot find the cf-ts executable")?;
+    if cfg!(windows) {
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(&exe, &old)
+            .with_context(|| format!("cannot replace {}", exe.display()))?;
+    }
+
+    // The install script of that release, told to put it where this one is.
+    let script = if cfg!(windows) { "install.ps1" } else { "install.sh" };
+    let url = format!("https://raw.githubusercontent.com/{REPO}/{tag}/{script}");
+    let status = installer(&url)
+        .env("CF_TS_VERSION", &tag)
+        .env("CF_TS_INSTALL_DIR", dir)
+        .env("CF_TS_NO_MODIFY_PATH", "1")
+        .status();
+    let installed = matches!(&status, Ok(status) if status.success());
+    if cfg!(windows) && !installed && !exe.exists() {
+        let _ = std::fs::rename(&old, &exe);
+    }
+    status.context("failed to start the installer")?;
+    if !installed {
+        bail!("update failed");
+    }
+    Ok(0)
+}
+
 fn main() {
-    if let Some(arg) = std::env::args().nth(1) {
+    let mut password = false;
+    let mut updating = false;
+    for arg in std::env::args().skip(1) {
         match arg.as_str() {
-            "-h" | "--help" => println!("{USAGE}"),
-            "-V" | "--version" => println!("cf-ts {}", env!("CARGO_PKG_VERSION")),
+            "update" => updating = true,
+            "-h" | "--help" => return println!("{USAGE}"),
+            "-V" | "--version" => return println!("cf-ts {}", env!("CARGO_PKG_VERSION")),
+            "-p" | "--password" => password = true,
             _ => {
                 eprintln!("error: unexpected argument '{arg}'\n\n{USAGE}");
                 exit(2);
             }
         }
-        return;
     }
 
-    // The picker and the name input hide the cursor while they are open;
-    // Ctrl+C would exit before it gets shown again, leaving the terminal
-    // without a cursor.
+    // The picker and the name input hide the cursor while they are open,
+    // and a password prompt turns off the echo; Ctrl+C would exit before
+    // either is undone, leaving the terminal without a cursor or echo.
+    save_terminal();
     let _ = ctrlc::set_handler(|| {
         close_picker();
+        restore_terminal();
         exit(130);
     });
 
-    let result = run();
+    // Left behind by an update on Windows, while the old cf-ts still ran.
+    if cfg!(windows) {
+        let _ = old_exe().map(std::fs::remove_file);
+    }
+
+    let result = match updating {
+        true => update(),
+        false => run(password),
+    };
     // Still open after Esc or an error.
     close_picker();
     match result {
@@ -1086,21 +1443,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_version_compares_by_number() {
+        assert_eq!(parse_version("v0.2.1"), Some(vec![0, 2, 1]));
+        assert_eq!(parse_version("0.2.1"), parse_version("v0.2.1"));
+        assert!(parse_version("v0.10.0") > parse_version("v0.9.3"));
+        assert!(parse_version("v1.0.0") > parse_version("v0.10.0"));
+        assert_eq!(parse_version("v1.0.0-rc1"), None);
+        assert_eq!(parse_version("latest; rm -rf ~"), None);
+    }
+
+    #[test]
+    fn login_failure_keeps_only_the_reason() {
+        let msg = "Authenticating...\n\nTemporary Authentication Code ( Get one at https://x/passcode ): \nTemporary Authentication Code ( Get one at https://x/passcode ): API endpoint:   https://api\nAPI version:    3.229.0\nNot logged in. Use 'cf login' or 'cf login --sso' to log in.\nFAILED\nInvalid passcode\nUnable to authenticate.";
+        assert_eq!(login_failure(msg), "Invalid passcode\nUnable to authenticate.");
+        assert_eq!(login_failure("FAILED"), "FAILED");
+    }
+
+    #[test]
     fn login_hint_recognizes_auth_failures() {
-        let reason =
-            |msg: &str| login_hint(msg).map(|hint| hint.lines().next().unwrap().to_string());
+        let reason = |msg: &str| login_hint(msg);
         assert_eq!(
-            reason("No API endpoint set. Use 'cf login'").as_deref(),
-            Some("no Cloud Foundry API endpoint set.")
+            reason("No API endpoint set. Use 'cf login'"),
+            Some("No Cloud Foundry API endpoint set.")
         );
         assert_eq!(
-            reason("Not logged in. Use 'cf login'").as_deref(),
-            Some("not logged in to Cloud Foundry.")
+            reason("Not logged in. Use 'cf login'"),
+            Some("Not logged in to Cloud Foundry.")
         );
         assert_eq!(
-            reason(r#"{"errors":[{"title":"CF-InvalidAuthToken","detail":"Invalid Auth Token"}]}"#)
-                .as_deref(),
-            Some("your Cloud Foundry session has expired.")
+            reason(r#"{"errors":[{"title":"CF-InvalidAuthToken","detail":"Invalid Auth Token"}]}"#),
+            Some("Your Cloud Foundry session has expired.")
+        );
+        assert_eq!(
+            reason(r#"[{"code":10002,"detail":"Authentication error","title":"CF-NotAuthenticated"}]"#),
+            Some("Your Cloud Foundry session has expired.")
         );
         assert_eq!(login_hint("Organization not found"), None);
     }

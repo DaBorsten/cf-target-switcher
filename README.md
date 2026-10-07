@@ -7,7 +7,8 @@ Interactively switch your Cloud Foundry org and space without logging in again.
 ## Requirements
 
 - The [cf CLI](https://github.com/cloudfoundry/cli) on your `PATH`
-- An active session (`cf login`)
+- An active session; without one, `cf-ts` logs you in with a one-time
+  passcode (`cf login --sso`), or with `cf-ts --password` by email and password
 
 ## Installation
 
@@ -30,7 +31,9 @@ The installer downloads the right binary for your system from the latest release
 | Linux, macOS  | `~/.local/bin/cf-ts`      | your shell profile (`.zshrc`, `.bashrc`, `.bash_profile`, fish config or `.profile`) |
 | Windows       | `%LOCALAPPDATA%\cf-ts\bin\cf-ts.exe` | the user `Path` environment variable (no admin rights needed) |
 
-Run the same command again to update. You can set these environment variables to change the defaults:
+To update, run `cf-ts update`: it looks up the latest release and, if it is newer than the one you have, installs it in place of it. Running the install command again does the same.
+
+You can set these environment variables to change the installer's defaults:
 
 | Variable               | Effect                                              |
 | ---------------------- | --------------------------------------------------- |
@@ -90,9 +93,13 @@ cf-ts
 Press Esc in the space list to go back to the orgs, for example after just looking which spaces an org has. Press Esc in the org list to cancel without changing the target.
 
 ```text
+Commands:
+  update          Update cf-ts to the latest release, if there is a newer one
+
 Options:
-  -h, --help     Print help
-  -V, --version  Print version
+  -p, --password  Log in with email and password instead of SSO
+  -h, --help      Print help
+  -V, --version   Print version
 ```
 
 ### Favorites
@@ -159,6 +166,8 @@ Press Tab on a saved target, in either list, to rename it, or clear the name to 
 ## Security
 
 `cf-ts` never sees your password and makes no network requests of its own. It only runs `cf curl` and `cf target`, plus `cf oauth-token` to check for a session when `cf curl` returns nothing, so authentication stays with the cf CLI. The token that prints is not used. From `config.json` it only uses the API endpoint and the names and GUIDs of the current org and space. The tokens in that file are neither stored, logged nor sent anywhere. The only file it writes is `cf-ts.json` with your favorites. Org and space names are passed to `cf` as plain arguments, never through a shell.
+
+The one exception to "no network requests" is `cf-ts update`, and only when you run it: it asks `curl` for the latest release on GitHub and, if that is newer, downloads and runs that release's install script, which checks the binary against the published SHA-256 checksum.
 
 ## Releasing
 
