@@ -216,17 +216,25 @@ fn combined_output(out: &std::process::Output) -> String {
 fn login_failure(msg: &str) -> String {
     let lines: Vec<&str> = msg
         .lines()
-        .map(|line| match line.starts_with("Temporary Authentication Code") {
-            // The prompt has no newline, so the next output follows it.
-            true => line.rsplit_once("): ").map_or("", |(_, rest)| rest),
-            false => line,
-        })
+        .map(
+            |line| match line.starts_with("Temporary Authentication Code") {
+                // The prompt has no newline, so the next output follows it.
+                true => line.rsplit_once("): ").map_or("", |(_, rest)| rest),
+                false => line,
+            },
+        )
         .map(str::trim)
         .filter(|line| {
             !line.is_empty()
-                && !["API endpoint:", "API version:", "Not logged in", "Authenticating", "FAILED"]
-                    .iter()
-                    .any(|noise| line.starts_with(noise))
+                && ![
+                    "API endpoint:",
+                    "API version:",
+                    "Not logged in",
+                    "Authenticating",
+                    "FAILED",
+                ]
+                .iter()
+                .any(|noise| line.starts_with(noise))
         })
         .collect();
     if lines.is_empty() {
@@ -411,7 +419,9 @@ fn cf_curl(path: &str) -> Result<Page> {
     };
     if let Some(errors) = value.get("errors") {
         let errors = errors.to_string();
-        return Err(cf_error(&errors, || format!("API error for {path}: {errors}")));
+        return Err(cf_error(&errors, || {
+            format!("API error for {path}: {errors}")
+        }));
     }
     Ok(serde_json::from_value(value)?)
 }
@@ -1148,7 +1158,15 @@ fn latest_tag() -> Result<String> {
     // GitHub redirects from here to the release's own page, which, unlike
     // its API, has no rate limit. curl is what the installer needs anyway.
     let out = Command::new("curl")
-        .args(["--proto", "=https", "--tlsv1.2", "-fsSLI", "-w", "%{url_effective}", "-o"])
+        .args([
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "-fsSLI",
+            "-w",
+            "%{url_effective}",
+            "-o",
+        ])
         .arg(if cfg!(windows) { "NUL" } else { "/dev/null" })
         .arg(format!("https://github.com/{REPO}/releases/latest"))
         .output()
@@ -1180,11 +1198,15 @@ fn installer(url: &str) -> Command {
 #[cfg(windows)]
 fn installer(url: &str) -> Command {
     let mut cmd = Command::new("powershell");
-    cmd.args(["-NoProfile", "-Command", "irm $env:CF_TS_INSTALL_SCRIPT | iex"])
-        .env("CF_TS_INSTALL_SCRIPT", url)
-        // Started from PowerShell 7, it would inherit that one's modules
-        // and not find its own, like the one with `Get-FileHash`.
-        .env_remove("PSModulePath");
+    cmd.args([
+        "-NoProfile",
+        "-Command",
+        "irm $env:CF_TS_INSTALL_SCRIPT | iex",
+    ])
+    .env("CF_TS_INSTALL_SCRIPT", url)
+    // Started from PowerShell 7, it would inherit that one's modules
+    // and not find its own, like the one with `Get-FileHash`.
+    .env_remove("PSModulePath");
     cmd
 }
 
@@ -1203,7 +1225,10 @@ fn update() -> Result<i32> {
         println!("cf-ts {current} is up to date.");
         return Ok(0);
     }
-    println!("Updating cf-ts {current} to {}…", tag.trim_start_matches('v'));
+    println!(
+        "Updating cf-ts {current} to {}…",
+        tag.trim_start_matches('v')
+    );
 
     let exe = std::env::current_exe().context("cannot find the cf-ts executable")?;
     let dir = exe.parent().context("cannot find the cf-ts directory")?;
@@ -1212,12 +1237,15 @@ fn update() -> Result<i32> {
     let old = old_exe().context("cannot find the cf-ts executable")?;
     if cfg!(windows) {
         let _ = std::fs::remove_file(&old);
-        std::fs::rename(&exe, &old)
-            .with_context(|| format!("cannot replace {}", exe.display()))?;
+        std::fs::rename(&exe, &old).with_context(|| format!("cannot replace {}", exe.display()))?;
     }
 
     // The install script of that release, told to put it where this one is.
-    let script = if cfg!(windows) { "install.ps1" } else { "install.sh" };
+    let script = if cfg!(windows) {
+        "install.ps1"
+    } else {
+        "install.sh"
+    };
     let url = format!("https://raw.githubusercontent.com/{REPO}/{tag}/{script}");
     let status = installer(&url)
         .env("CF_TS_VERSION", &tag)
@@ -1455,7 +1483,10 @@ mod tests {
     #[test]
     fn login_failure_keeps_only_the_reason() {
         let msg = "Authenticating...\n\nTemporary Authentication Code ( Get one at https://x/passcode ): \nTemporary Authentication Code ( Get one at https://x/passcode ): API endpoint:   https://api\nAPI version:    3.229.0\nNot logged in. Use 'cf login' or 'cf login --sso' to log in.\nFAILED\nInvalid passcode\nUnable to authenticate.";
-        assert_eq!(login_failure(msg), "Invalid passcode\nUnable to authenticate.");
+        assert_eq!(
+            login_failure(msg),
+            "Invalid passcode\nUnable to authenticate."
+        );
         assert_eq!(login_failure("FAILED"), "FAILED");
     }
 
@@ -1475,7 +1506,9 @@ mod tests {
             Some("Your Cloud Foundry session has expired.")
         );
         assert_eq!(
-            reason(r#"[{"code":10002,"detail":"Authentication error","title":"CF-NotAuthenticated"}]"#),
+            reason(
+                r#"[{"code":10002,"detail":"Authentication error","title":"CF-NotAuthenticated"}]"#
+            ),
             Some("Your Cloud Foundry session has expired.")
         );
         assert_eq!(login_hint("Organization not found"), None);
