@@ -1219,6 +1219,19 @@ impl Spaces {
     }
 }
 
+/// However `run` ends (Esc, an error), a fetch still going on is waited for:
+/// its cf would otherwise outlive cf-ts and could write back an old target
+/// over one set by hand right after.
+impl Drop for Spaces {
+    fn drop(&mut self) {
+        if self.ahead.is_some() {
+            // Not with a picker on the screen that no longer takes keys.
+            close_picker();
+            self.settle();
+        }
+    }
+}
+
 fn target(spaces: &mut Spaces, org: &str, space: Option<&str>) -> Result<i32> {
     finish_picker()?;
     spaces.settle();
@@ -1697,5 +1710,261 @@ mod tests {
             Some("Your Cloud Foundry session has expired.")
         );
         assert_eq!(login_hint("Organization not found"), None);
+    }
+
+    #[test]
+    fn cf_error_tells_login_from_other_failures() {
+        let err = cf_error("Not logged in. Use 'cf login'", || "other".to_string());
+        let needs_login = err.downcast_ref::<NeedsLogin>().expect("a NeedsLogin");
+        assert_eq!(needs_login.0, "Not logged in to Cloud Foundry.");
+
+        let err = cf_error("Organization not found", || "cf failed".to_string());
+        assert!(err.downcast_ref::<NeedsLogin>().is_none());
+        assert_eq!(err.to_string(), "cf failed");
+    }
+
+    #[test]
+    fn combined_output_drops_the_bare_failed_line() {
+        let output = |stdout: &str, stderr: &str| std::process::Output {
+            status: Default::default(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(
+            combined_output(&output("  body\n", "\nwarning  ")),
+            "body\nwarning"
+        );
+        assert_eq!(combined_output(&output("FAILED\n", "reason")), "reason");
+        assert_eq!(combined_output(&output("", "")), "");
+    }
+
+    #[test]
+    fn ctrl_is_ctrl_alone() {
+        let key = |modifiers| KeyEvent::new(KeyCode::Char('c'), modifiers);
+        assert!(ctrl(&key(KeyModifiers::CONTROL)));
+        assert!(ctrl(&key(KeyModifiers::CONTROL | KeyModifiers::SHIFT)));
+        // AltGr on Windows.
+        assert!(!ctrl(&key(KeyModifiers::CONTROL | KeyModifiers::ALT)));
+        assert!(!ctrl(&key(KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn cf_config_reads_the_fields_of_config_json() {
+        let json = r#"{
+            "ConfigVersion": 3,
+            "Target": "https://api.example.com",
+            "AuthorizationEndpoint": "https://login.example.com",
+            "AccessToken": "bearer secret",
+            "OrganizationFields": {"GUID": "org-guid", "Name": "org"},
+            "SpaceFields": {"GUID": "space-guid", "Name": "dev", "AllowSSH": true}
+        }"#;
+        let config: CfConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.api, "https://api.example.com");
+        assert_eq!(config.login, "https://login.example.com");
+        assert_eq!(
+            (config.org.guid.as_str(), config.org.name.as_str()),
+            ("org-guid", "org")
+        );
+        assert_eq!(config.space.name, "dev");
+
+        // Without a target, as after `cf api` alone.
+        let config: CfConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.api.is_empty() && config.org.name.is_empty());
+    }
+
+    fn config_with(org: &str, space: &str) -> CfConfig {
+        CfConfig {
+            org: Target {
+                name: org.to_string(),
+                ..Default::default()
+            },
+            space: Target {
+                name: space.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn known_target_prefers_the_current_one() {
+        let favorites = Favorites {
+            orgs: names(&[("fav-org", "Fav")]),
+            targets: BTreeMap::from([("saved-org".to_string(), names(&[("prod", "P")]))]),
+        };
+        let config = config_with("org", "dev");
+        assert_eq!(
+            known_target(&config, Some(&favorites)),
+            Some(("org", Some("dev")))
+        );
+        let config = config_with("org", "");
+        assert_eq!(known_target(&config, Some(&favorites)), Some(("org", None)));
+    }
+
+    #[test]
+    fn known_target_falls_back_to_favorites() {
+        let config = CfConfig::default();
+        let mut favorites = Favorites {
+            orgs: names(&[("fav-org", "Fav")]),
+            targets: BTreeMap::from([("saved-org".to_string(), names(&[("prod", "P")]))]),
+        };
+        assert_eq!(
+            known_target(&config, Some(&favorites)),
+            Some(("saved-org", Some("prod")))
+        );
+        // An org left without spaces is no target.
+        favorites
+            .targets
+            .insert("saved-org".to_string(), BTreeMap::new());
+        assert_eq!(
+            known_target(&config, Some(&favorites)),
+            Some(("fav-org", None))
+        );
+        assert_eq!(known_target(&config, Some(&Favorites::default())), None);
+        assert_eq!(known_target(&config, None), None);
+    }
+
+    /// Points `CF_HOME` at an empty directory of its own for as long as it
+    /// lives. Tests that use it run one at a time, as they share the
+    /// environment.
+    struct TempCfHome {
+        dir: PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TempCfHome {
+        fn new(name: &str) -> Self {
+            static LOCK: Mutex<()> = Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir =
+                std::env::temp_dir().join(format!("cf-ts-test-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::env::set_var("CF_HOME", &dir);
+            TempCfHome { dir, _lock: lock }
+        }
+
+        fn file(&self, name: &str) -> PathBuf {
+            self.dir.join(".cf").join(name)
+        }
+    }
+
+    impl Drop for TempCfHome {
+        fn drop(&mut self) {
+            std::env::remove_var("CF_HOME");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn cf_home_prefers_cf_home() {
+        let home = TempCfHome::new("cf-home");
+        assert_eq!(cf_home(), Some(home.dir.clone()));
+        assert_eq!(favorites_path(), Some(home.file("cf-ts.json")));
+        // Set but empty is the same as not set.
+        std::env::set_var("CF_HOME", "");
+        assert_ne!(cf_home(), Some(PathBuf::new()));
+    }
+
+    #[test]
+    fn favorites_round_trip_through_the_file() {
+        let home = TempCfHome::new("round-trip");
+        assert!(read_favorites().unwrap().is_empty());
+
+        let mut all = AllFavorites::new();
+        let favorites = all.entry("https://api".to_string()).or_default();
+        favorites.orgs = names(&[("org", "Mine")]);
+        favorites
+            .targets
+            .insert("org".to_string(), names(&[("dev", "Dev")]));
+        // Emptied by removing the last name: not to be written.
+        favorites
+            .targets
+            .insert("old-org".to_string(), BTreeMap::new());
+        all.insert("https://other".to_string(), Favorites::default());
+        save_favorites(&mut all).unwrap();
+
+        let read = read_favorites().unwrap();
+        assert_eq!(read.keys().collect::<Vec<_>>(), ["https://api"]);
+        assert_eq!(read["https://api"].orgs, names(&[("org", "Mine")]));
+        assert_eq!(
+            read["https://api"].targets.keys().collect::<Vec<_>>(),
+            ["org"]
+        );
+        // Written in full, and nothing left next to it.
+        assert!(std::fs::read_to_string(home.file("cf-ts.json"))
+            .unwrap()
+            .ends_with("}\n"));
+        assert!(!home.file("cf-ts.json.tmp").exists());
+    }
+
+    #[test]
+    fn load_favorites_moves_an_invalid_file_aside() {
+        let home = TempCfHome::new("invalid");
+        std::fs::create_dir_all(home.file("")).unwrap();
+        std::fs::write(home.file("cf-ts.json"), "{ not json").unwrap();
+
+        assert!(load_favorites().is_empty());
+        assert!(!home.file("cf-ts.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.file("cf-ts.json.bak")).unwrap(),
+            "{ not json"
+        );
+    }
+
+    #[test]
+    fn edit_favorites_keeps_what_was_saved_in_between() {
+        let _home = TempCfHome::new("edit");
+        let mut all = load_favorites();
+
+        // Saved by another cf-ts after this one read the file.
+        let mut other = AllFavorites::new();
+        other.entry("https://api".to_string()).or_default().orgs = names(&[("org-a", "A")]);
+        save_favorites(&mut other).unwrap();
+
+        edit_favorites(&mut all, "https://api", |f| {
+            set_name(&mut f.orgs, "org-b", "B".to_string())
+        })
+        .unwrap();
+        let expected = names(&[("org-a", "A"), ("org-b", "B")]);
+        assert_eq!(all["https://api"].orgs, expected);
+        assert_eq!(read_favorites().unwrap()["https://api"].orgs, expected);
+    }
+
+    #[test]
+    fn spaces_keep_what_was_fetched_ahead() {
+        let mut spaces = Spaces::default();
+        spaces.ahead = Some((
+            "org-guid".to_string(),
+            std::thread::spawn(|| Ok(vec![resource("dev")])),
+        ));
+        // Taken from the fetch, without asking cf.
+        assert_eq!(order(&spaces.of("org-guid").unwrap()), ["dev"]);
+        assert!(spaces.ahead.is_none());
+
+        // A failed fetch is not kept, so that the org is asked for again.
+        spaces.ahead = Some((
+            "other-guid".to_string(),
+            std::thread::spawn(|| bail!("cf curl failed")),
+        ));
+        spaces.settle();
+        assert!(!spaces.fetched.contains_key("other-guid"));
+    }
+
+    #[test]
+    fn spaces_wait_for_the_fetch_when_dropped() {
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let mut spaces = Spaces::default();
+        let flag = done.clone();
+        spaces.ahead = Some((
+            "org-guid".to_string(),
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                flag.store(true, Ordering::SeqCst);
+                Ok(Vec::new())
+            }),
+        ));
+        drop(spaces);
+        assert!(done.load(Ordering::SeqCst));
     }
 }
