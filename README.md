@@ -24,7 +24,7 @@ curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/DaBorste
 irm https://raw.githubusercontent.com/DaBorsten/cf-target-switcher/main/install.ps1 | iex
 ```
 
-The installer downloads the right binary for your system from the latest release and checks it against the published SHA-256 checksum. It also puts the install directory on your `PATH`, so `cf-ts` works in any new terminal:
+The installer downloads the right binary for your system from the latest release and checks it against the published SHA-256 checksum. If you have the [GitHub CLI](https://cli.github.com/) and are logged in to it, the installer also verifies the [build provenance](#verifying-a-download) of the download. It also puts the install directory on your `PATH`, so `cf-ts` works in any new terminal:
 
 | OS            | Installs to               | PATH is set in                                        |
 | ------------- | ------------------------- | ----------------------------------------------------- |
@@ -40,6 +40,7 @@ You can set these environment variables to change the installer's defaults:
 | `CF_TS_VERSION`        | Install a specific release, e.g. `v0.1.0`           |
 | `CF_TS_INSTALL_DIR`    | Install somewhere else                              |
 | `CF_TS_NO_MODIFY_PATH` | Set to `1` to leave your `PATH` alone               |
+| `CF_TS_SKIP_ATTESTATION` | Set to `1` to not verify the build provenance     |
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/DaBorsten/cf-target-switcher/main/install.sh | CF_TS_VERSION=v0.1.0 sh
@@ -161,13 +162,19 @@ Press Tab on a saved target, in either list, to rename it, or clear the name to 
 }
 ```
 
-`cf-ts` reads the current target from `$CF_HOME/.cf/config.json` (falling back to your home directory), the same location the cf CLI uses.
+`cf-ts` reads the current target from `$CF_HOME/.cf/config.json`, the same location the cf CLI uses. Without `CF_HOME`, that is your home directory: `$HOME` on Linux and macOS, `%HOMEDRIVE%%HOMEPATH%` and then `%USERPROFILE%` on Windows.
+
+If `cf-ts.json` cannot be read as JSON, `cf-ts` moves it to `cf-ts.json.bak` and goes on without favorites.
+
+### Git Bash on Windows
+
+The picker reads keys from the Windows console. mintty, the terminal Git Bash opens by default, has none, so run `winpty cf-ts` there. Git Bash inside Windows Terminal or VS Code works as it is.
 
 ## Security
 
 `cf-ts` never sees your password and makes no network requests of its own. It only runs `cf curl` and `cf target`, plus `cf oauth-token` to check for a session when `cf curl` returns nothing, so authentication stays with the cf CLI. The token that prints is not used. From `config.json` it only uses the API endpoint and the names and GUIDs of the current org and space. The tokens in that file are neither stored, logged nor sent anywhere. The only file it writes is `cf-ts.json` with your favorites. Org and space names are passed to `cf` as plain arguments, never through a shell.
 
-The one exception to "no network requests" is `cf-ts update`, and only when you run it: it asks `curl` for the latest release on GitHub and, if that is newer, downloads and runs that release's install script, which checks the binary against the published SHA-256 checksum.
+The one exception to "no network requests" is `cf-ts update`, and only when you run it: it asks `curl` for the latest release on GitHub and, if that is newer, downloads and runs that release's install script, which checks the binary against the published SHA-256 checksum and, with a GitHub CLI that is logged in, its build provenance.
 
 ## Releasing
 

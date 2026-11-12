@@ -13,7 +13,7 @@ categories = ["command-line-utilities"]
 anyhow = "1"
 console = "0.16"
 crossterm = "0.29"
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 fuzzy-matcher = "0.3"
 serde = { version = "1", features = ["derive"] }
