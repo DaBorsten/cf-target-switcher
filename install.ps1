@@ -6,6 +6,7 @@
 #   CF_TS_VERSION          release tag to install, e.g. v0.1.0 (default: latest)
 #   CF_TS_INSTALL_DIR      target directory (default: %LOCALAPPDATA%\cf-ts\bin)
 #   CF_TS_NO_MODIFY_PATH   set to 1 to leave the user PATH untouched
+#   CF_TS_SKIP_ATTESTATION set to 1 to not verify the build provenance with gh
 
 # Runs in a script block so errors surface via `throw` without closing the
 # console when piped into `iex`.
@@ -52,6 +53,37 @@
         $expected = ($line -split '\s+')[0]
         $actual = (Get-FileHash $zip -Algorithm SHA256).Hash
         if ($actual -ne $expected) { throw "Checksum mismatch for $asset" }
+
+        # The checksum comes from the same release as the archive, so it only
+        # tells that the download is intact. The attestation tells that the
+        # archive was built by this repository's release workflow. Checking
+        # it takes a GitHub CLI that is logged in, so it is done where there
+        # is one.
+        if ($env:CF_TS_SKIP_ATTESTATION -ne '1' -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+            # With 'Stop', Windows PowerShell turns anything a native
+            # command writes to stderr into a terminating error.
+            $ErrorActionPreference = 'Continue'
+            try {
+                & gh attestation verify --help 2>&1 | Out-Null
+                $usable = $LASTEXITCODE -eq 0
+                if ($usable) {
+                    & gh auth status 2>&1 | Out-Null
+                    $usable = $LASTEXITCODE -eq 0
+                }
+                if ($usable) {
+                    & gh attestation verify $zip --repo $repo 2>&1 | Out-Null
+                    $verified = $LASTEXITCODE -eq 0
+                }
+            } finally {
+                $ErrorActionPreference = 'Stop'
+            }
+            if ($usable) {
+                if (-not $verified) {
+                    throw "Could not verify the build provenance of $asset (set CF_TS_SKIP_ATTESTATION=1 to install without)"
+                }
+                Write-Host 'Verified build provenance.'
+            }
+        }
 
         Expand-Archive $zip -DestinationPath $tmp
         New-Item -ItemType Directory -Force $dir | Out-Null

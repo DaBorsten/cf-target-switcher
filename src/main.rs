@@ -4,19 +4,20 @@
 //! picker and then runs `cf target -o ORG -s SPACE`.
 
 use anyhow::{bail, Context, Result};
-use console::{Key, Style, Term};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use console::{Style, Term};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 use dialoguer::theme::{ColorfulTheme, Theme};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{exit, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 const USAGE: &str = "\
@@ -91,12 +92,29 @@ struct Target {
     name: String,
 }
 
+/// The directory cf keeps its `.cf` in: `$CF_HOME`, otherwise the home
+/// directory, looked up the way cf does it (`util/configv3` in its source).
 fn cf_home() -> Option<PathBuf> {
-    // cf uses $CF_HOME, otherwise the home directory (Unix: HOME, Windows: USERPROFILE).
-    ["CF_HOME", "HOME", "USERPROFILE"]
-        .iter()
-        .find_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()))
-        .map(PathBuf::from)
+    let var = |name: &str| std::env::var_os(name).filter(|s| !s.is_empty());
+    if let Some(home) = var("CF_HOME") {
+        return Some(home.into());
+    }
+    // Windows: HOMEDRIVE + HOMEPATH, which can be another place than
+    // USERPROFILE (a network drive, say). HOME, as Git Bash sets it, is not
+    // looked at.
+    #[cfg(windows)]
+    {
+        let mut home = var("HOMEDRIVE").unwrap_or_default();
+        home.push(var("HOMEPATH").unwrap_or_default());
+        Some(home)
+            .filter(|home| !home.is_empty())
+            .or_else(|| var("USERPROFILE"))
+            .map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        var("HOME").map(PathBuf::from)
+    }
 }
 
 fn read_config() -> CfConfig {
@@ -125,7 +143,8 @@ fn favorites_path() -> Option<PathBuf> {
     cf_home().map(|h| h.join(".cf").join("cf-ts.json"))
 }
 
-fn load_favorites() -> Result<AllFavorites> {
+/// The favorites file as it is; none at all is the same as an empty one.
+fn read_favorites() -> Result<AllFavorites> {
     let Some(path) = favorites_path() else {
         return Ok(AllFavorites::default());
     };
@@ -135,6 +154,25 @@ fn load_favorites() -> Result<AllFavorites> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AllFavorites::default()),
         Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
     }
+}
+
+/// The favorites to start with. A file that cannot be used is no reason not
+/// to switch targets: it costs the favorites, with a warning.
+fn load_favorites() -> AllFavorites {
+    let error = match read_favorites() {
+        Ok(all) => return all,
+        Err(e) => e,
+    };
+    eprintln!("warning: {error:#}; going on without favorites");
+    // Out of the way, so that saving a favorite does not overwrite a file
+    // that can still be repaired by hand.
+    if let Some(path) = favorites_path().filter(|_| error.is::<serde_json::Error>()) {
+        let backup = path.with_extension("json.bak");
+        if std::fs::rename(&path, &backup).is_ok() {
+            eprintln!("warning: moved it to {}", backup.display());
+        }
+    }
+    AllFavorites::default()
 }
 
 fn save_favorites(favorites: &mut AllFavorites) -> Result<()> {
@@ -148,8 +186,27 @@ fn save_favorites(favorites: &mut AllFavorites) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(favorites)? + "\n")
+    // Written next to the file and then renamed over it: cut short, a write
+    // straight to the file would leave half of one behind.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(favorites)? + "\n")
+        .and_then(|_| std::fs::rename(&tmp, &path))
         .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Applies `edit` to the favorites of the API endpoint `api` and saves them.
+fn edit_favorites(
+    all: &mut AllFavorites,
+    api: &str,
+    edit: impl FnOnce(&mut Favorites),
+) -> Result<()> {
+    // Read again first: another cf-ts may have saved changes of its own
+    // since, and they would be lost by writing what was read at the start.
+    if let Ok(fresh) = read_favorites() {
+        *all = fresh;
+    }
+    edit(all.entry(api.to_string()).or_default());
+    save_favorites(all)
 }
 
 /// cf has no usable session. `run` answers this with `cf login`; where it
@@ -498,6 +555,11 @@ fn open_picker(term: &Term) -> Result<()> {
     // was asked there, every look at the size from the alternate screen
     // takes half a second, and the picker draws and reads keys that slowly.
     let _ = term.size();
+    // The Windows console only reads escape sequences once it is told to,
+    // which `console` does when it first colors something: too late for the
+    // one below, and never with NO_COLOR set.
+    #[cfg(windows)]
+    let _ = crossterm::ansi_support::supports_ansi();
     term.write_str("\x1b[?1049h")?;
     PICKER_OPEN.store(true, Ordering::SeqCst);
     Ok(())
@@ -511,7 +573,10 @@ fn close_picker() {
         let _ = terminal::disable_raw_mode();
         let _ = term.write_str("\x1b[?1049l");
     }
-    let _ = term.show_cursor();
+    // Not into a file or pipe that stderr was sent to.
+    if term.is_term() {
+        let _ = term.show_cursor();
+    }
 }
 
 /// The terminal's settings as cf-ts found them, for Ctrl+C to put back.
@@ -540,6 +605,60 @@ fn save_terminal() {}
 
 #[cfg(not(unix))]
 fn restore_terminal() {}
+
+/// Fails where the picker could not be used, before anything else is done.
+fn check_terminal() -> Result<()> {
+    if !std::io::stderr().is_terminal() {
+        bail!("cf-ts shows its picker on stderr, which is not a terminal");
+    }
+    // mintty, the terminal of Git Bash, talks to programs through pipes
+    // unless it runs them in a pseudo console. Rust tells such a pipe from
+    // others, but keys pressed never reach the Windows console that
+    // crossterm reads them from.
+    #[cfg(windows)]
+    {
+        use crossterm::tty::IsTty;
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() && !stdin.is_tty() {
+            bail!(
+                "this terminal (mintty, as Git Bash uses it) has no Windows console to read keys from.\n\
+                 Run `winpty cf-ts` instead, or use Windows Terminal or the terminal of VS Code."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether `key` was pressed with Ctrl, as a shortcut. AltGr comes as
+/// Ctrl+Alt on Windows, so only Ctrl alone is one and not text.
+fn ctrl(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// Waits in raw mode for a key. `None` if the terminal changed its size
+/// instead: what is on it has to be drawn again then. Not every terminal
+/// reports that as an event, hence the look at the size in between.
+fn read_key(term: &Term) -> Result<Option<KeyEvent>> {
+    let size = term.size();
+    loop {
+        if !event::poll(Duration::from_millis(100))? {
+            if term.size() != size {
+                return Ok(None);
+            }
+            continue;
+        }
+        match event::read()? {
+            // In raw mode Ctrl+C is a key like any other.
+            Event::Key(key) if ctrl(&key) && key.code == KeyCode::Char('c') => {
+                close_picker();
+                exit(130);
+            }
+            Event::Key(key) if key.kind != KeyEventKind::Release => return Ok(Some(key)),
+            Event::Resize(..) => return Ok(None),
+            _ => {}
+        }
+    }
+}
 
 /// Leaves the alternate screen for good and shows what was picked.
 fn finish_picker() -> Result<()> {
@@ -783,41 +902,36 @@ fn pick_on(
         // cut to the terminal's width, as a wrapped one would push the frame
         // off the screen; the reset is for a style the cut left open.
         let cols = (term.size().1 as usize).max(1);
+        let empty_line = frame.len() - 2;
         let frame: Vec<String> = frame
             .iter()
-            .map(|line| format!("{}\x1b[0m\x1b[K", console::truncate_str(line, cols, "…")))
+            .enumerate()
+            .map(|(n, line)| {
+                let line = console::truncate_str(line, cols, "…");
+                let erase = match n {
+                    // What an earlier frame left to the right of the line.
+                    // Not behind a line as wide as the terminal: the cursor
+                    // is still on its last character then, and erasing from
+                    // there would take that one away.
+                    _ if n < empty_line => match console::measure_text_width(&line) < cols {
+                        true => "\x1b[K",
+                        false => "",
+                    },
+                    // From the empty line on, all that is below: the footer
+                    // is written onto an erased line and needs no more.
+                    _ if n == empty_line => "\x1b[J",
+                    _ => "",
+                };
+                format!("{line}\x1b[0m{erase}")
+            })
             .collect();
-        term.write_str(&format!("\x1b[H{}\x1b[J", frame.join("\r\n")))?;
+        term.write_str(&format!("\x1b[H{}", frame.join("\r\n")))?;
 
-        // Wait for a key, or for the terminal to change its size: then the
-        // frame is drawn again right away. Not every terminal reports that
-        // as an event, hence the look at the size in between.
-        let size = term.size();
-        let key = loop {
-            if !event::poll(Duration::from_millis(100))? {
-                if term.size() != size {
-                    break None;
-                }
-                continue;
-            }
-            match event::read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => break Some(key),
-                Event::Resize(..) => break None,
-                _ => {}
-            }
-        };
-        let Some(key) = key else { continue };
-        // AltGr comes as Ctrl+Alt on Windows, so only Ctrl alone is a
-        // shortcut and not text.
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT);
+        // A changed size has the frame drawn again right away.
+        let Some(key) = read_key(term)? else { continue };
+        let ctrl = ctrl(&key);
 
         match key.code {
-            // In raw mode Ctrl+C is a key like any other.
-            KeyCode::Char('c') if ctrl => {
-                close_picker();
-                exit(130);
-            }
             KeyCode::Esc => return Ok(Picked::Cancelled),
             KeyCode::Enter if !matches.is_empty() => return Ok(Picked::Item(matches[sel].0)),
             KeyCode::Tab if !matches.is_empty() => return Ok(Picked::Tab(matches[sel].0)),
@@ -846,40 +960,37 @@ fn input(prompt: &str, initial: &str) -> Result<Option<String>> {
     let term = Term::stderr();
     let mut prefix = String::new();
     ColorfulTheme::default().format_input_prompt(&mut prefix, prompt, None)?;
-    let cols = (term.size().1 as usize).max(1);
-    // In place of the picker it was asked from.
-    term.write_str("\x1b[H\x1b[J")?;
     term.show_cursor()?;
 
     let mut text = initial.to_string();
-    // Terminal lines the prompt wrapped onto, above the cursor's line.
-    let mut wrapped = 0;
-    loop {
-        term.clear_line()?;
-        term.clear_last_lines(wrapped)?;
-        let line = format!("{prefix}{text}");
-        term.write_str(&line)?;
-        wrapped = console::measure_text_width(&line).saturating_sub(1) / cols;
-
-        let done = match term.read_key()? {
-            Key::Escape => Some(None),
-            Key::Enter => Some(Some(text.clone())),
-            Key::Backspace => {
-                text.pop();
-                None
+    // Keys are read the way the picker reads them: one reader for both
+    // loses none that were typed ahead, and tells when the terminal was
+    // resized.
+    terminal::enable_raw_mode()?;
+    let mut ask = || -> Result<Option<String>> {
+        loop {
+            // In place of the picker it was asked from, and from the top
+            // left corner each time: however the terminal wraps the line,
+            // nothing of an earlier one is left.
+            term.write_str(&format!("\x1b[H\x1b[J{prefix}{text}"))?;
+            let Some(key) = read_key(&term)? else {
+                continue;
+            };
+            match key.code {
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Enter => return Ok(Some(text.clone())),
+                KeyCode::Backspace => {
+                    text.pop();
+                }
+                KeyCode::Char(c) if !ctrl(&key) && !c.is_ascii_control() => text.push(c),
+                _ => {}
             }
-            Key::Char(c) if !c.is_ascii_control() => {
-                text.push(c);
-                None
-            }
-            _ => None,
-        };
-        if let Some(result) = done {
-            term.clear_line()?;
-            term.clear_last_lines(wrapped)?;
-            return Ok(result);
         }
-    }
+    };
+    let result = ask();
+    let _ = terminal::disable_raw_mode();
+    let _ = term.write_str("\x1b[H\x1b[J");
+    result
 }
 
 /// Asks for the user's own name for `what`, an org or an org and a space.
@@ -994,23 +1105,27 @@ fn pick_first(
             Picked::Tab(i) => {
                 // Keep the edited row selected when the picker comes back.
                 current = rows.swap_remove(i);
-                let changed = match &current {
+                match &current {
                     Row::Target { org, space } => {
-                        let spaces = favorites.targets.entry(org.clone()).or_default();
-                        let old = spaces.get(space).cloned().unwrap_or_default();
-                        edit_name(&[org, space], &old)?.map(|name| set_name(spaces, space, name))
+                        let saved = favorites.targets.get(org);
+                        let old = saved.and_then(|s| s.get(space)).cloned();
+                        if let Some(name) = edit_name(&[org, space], &old.unwrap_or_default())? {
+                            edit_favorites(all, &config.api, |f| {
+                                set_name(f.targets.entry(org.clone()).or_default(), space, name)
+                            })?;
+                        }
                     }
                     Row::Org(guid) => {
                         let Some(org) = orgs.iter().find(|o| &o.guid == guid) else {
                             continue;
                         };
                         let old = favorites.orgs.get(&org.name).cloned().unwrap_or_default();
-                        edit_name(&[&org.name], &old)?
-                            .map(|name| set_name(&mut favorites.orgs, &org.name, name))
+                        if let Some(name) = edit_name(&[&org.name], &old)? {
+                            edit_favorites(all, &config.api, |f| {
+                                set_name(&mut f.orgs, &org.name, name)
+                            })?;
+                        }
                     }
-                };
-                if changed.is_some() {
-                    save_favorites(all)?;
                 }
             }
         }
@@ -1048,29 +1163,95 @@ fn pick_space(
                 let space = &spaces[i].name;
                 let old = saved.get(space).cloned().unwrap_or_default();
                 if let Some(name) = edit_name(&[org, space], &old)? {
-                    set_name(saved, space, name);
-                    save_favorites(all)?;
+                    edit_favorites(all, &config.api, |f| {
+                        set_name(f.targets.entry(org.to_string()).or_default(), space, name)
+                    })?;
                 }
             }
         }
     }
 }
 
-fn target(org: &str, space: Option<&str>) -> Result<i32> {
+fn list_spaces(org_guid: &str) -> Result<Vec<Resource>> {
+    list_all(&format!(
+        "/v3/spaces?organization_guids={org_guid}&order_by=name&per_page=5000"
+    ))
+}
+
+/// The spaces of the orgs, by org GUID, as far as they were asked for.
+#[derive(Default)]
+struct Spaces {
+    fetched: HashMap<String, Vec<Resource>>,
+    /// Those of one org, being fetched while the org picker is open.
+    ahead: Option<(String, JoinHandle<Result<Vec<Resource>>>)>,
+}
+
+impl Spaces {
+    /// Starts fetching the spaces of an org that is likely to be picked, so
+    /// that they are there by the time it is.
+    fn fetch_ahead(&mut self, org_guid: &str) {
+        let guid = org_guid.to_string();
+        let fetch = std::thread::spawn(move || list_spaces(&guid));
+        self.ahead = Some((org_guid.to_string(), fetch));
+    }
+
+    /// Waits for what `fetch_ahead` started. Has to be done before cf is
+    /// run again: cf writes its config when it ends, and one that started
+    /// earlier would put back what the other changed, like the target.
+    fn settle(&mut self) {
+        if let Some((guid, fetch)) = self.ahead.take() {
+            // Not worth an error if it failed: they are fetched again, and
+            // that tells why, if the org is picked.
+            if let Ok(Ok(spaces)) = fetch.join() {
+                self.fetched.insert(guid, spaces);
+            }
+        }
+    }
+
+    fn of(&mut self, org_guid: &str) -> Result<Vec<Resource>> {
+        self.settle();
+        if let Some(spaces) = self.fetched.get(org_guid) {
+            return Ok(spaces.clone());
+        }
+        let spaces = list_spaces(org_guid)?;
+        self.fetched.insert(org_guid.to_string(), spaces.clone());
+        Ok(spaces)
+    }
+}
+
+/// However `run` ends (Esc, an error), a fetch still going on is waited for:
+/// its cf would otherwise outlive cf-ts and could write back an old target
+/// over one set by hand right after.
+impl Drop for Spaces {
+    fn drop(&mut self) {
+        if self.ahead.is_some() {
+            // Not with a picker on the screen that no longer takes keys.
+            close_picker();
+            self.settle();
+        }
+    }
+}
+
+fn target(spaces: &mut Spaces, org: &str, space: Option<&str>) -> Result<i32> {
     finish_picker()?;
+    spaces.settle();
     let mut args = vec!["target", "-o", org];
     if let Some(space) = space {
         args.extend(["-s", space]);
     }
-    let status = Command::new("cf").args(&args).status()?;
+    let status = Command::new("cf")
+        .args(&args)
+        .status()
+        .context("failed to start cf – is the cf CLI on your PATH?")?;
     Ok(status.code().unwrap_or(1))
 }
 
 fn run(password: bool) -> Result<i32> {
     const ORGS: &str = "/v3/organizations?order_by=name&per_page=5000";
 
+    check_terminal()?;
     let mut config = read_config();
-    let mut all = load_favorites()?;
+    let mut all = load_favorites();
 
     let mut orgs = match list_all(ORGS) {
         // Without a session, log in right here instead of sending the user
@@ -1110,27 +1291,31 @@ fn run(password: bool) -> Result<i32> {
     // What was typed in the org picker, so it is still there after coming
     // back from the spaces.
     let mut search = String::new();
+
+    // The org picker starts on the current org, and staying in it to switch
+    // the space is common: fetch its spaces while the picker is open.
+    let mut spaces = Spaces::default();
+    if orgs.iter().any(|o| o.guid == config.org.guid) {
+        spaces.fetch_ahead(&config.org.guid);
+    }
     loop {
         let org = match pick_first(&config, &mut all, &mut orgs, current, &mut search)? {
             None => return Ok(1), // cancelled with Esc
-            Some(First::Target { org, space }) => return target(&org, Some(&space)),
+            Some(First::Target { org, space }) => return target(&mut spaces, &org, Some(&space)),
             Some(First::Org(org)) => org,
         };
 
-        let spaces = list_all(&format!(
-            "/v3/spaces?organization_guids={}&order_by=name&per_page=5000",
-            org.guid
-        ))?;
-        if spaces.is_empty() {
+        let in_org = spaces.of(&org.guid)?;
+        if in_org.is_empty() {
             finish_picker()?;
             eprintln!("Org has no spaces, targeting the org only.");
-            return target(&org.name, None);
+            return target(&mut spaces, &org.name, None);
         }
 
         // A single space gets the picker too: Tab there is the only way to
         // save it as a target.
-        match pick_space(&config, &mut all, &org.name, spaces)? {
-            Some(space) => return target(&org.name, Some(&space)),
+        match pick_space(&config, &mut all, &org.name, in_org)? {
+            Some(space) => return target(&mut spaces, &org.name, Some(&space)),
             // Esc: back to the org picker, with this org selected.
             None => {
                 // Forget the "Org: NAME" line the org picker left behind.
@@ -1279,15 +1464,28 @@ fn main() {
         }
     }
 
+    if updating && password {
+        eprintln!("error: '--password' cannot be used with 'update'\n\n{USAGE}");
+        exit(2);
+    }
+
     // The picker and the name input hide the cursor while they are open,
     // and a password prompt turns off the echo; Ctrl+C would exit before
-    // either is undone, leaving the terminal without a cursor or echo.
+    // either is undone, leaving the terminal without a cursor or echo. The
+    // same goes for being told to end (SIGTERM, a closed terminal) and for
+    // a panic, whose message would also be lost on the alternate screen.
     save_terminal();
     let _ = ctrlc::set_handler(|| {
         close_picker();
         restore_terminal();
         exit(130);
     });
+    let panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        close_picker();
+        restore_terminal();
+        panic_hook(info);
+    }));
 
     // Left behind by an update on Windows, while the old cf-ts still ran.
     if cfg!(windows) {
@@ -1512,5 +1710,261 @@ mod tests {
             Some("Your Cloud Foundry session has expired.")
         );
         assert_eq!(login_hint("Organization not found"), None);
+    }
+
+    #[test]
+    fn cf_error_tells_login_from_other_failures() {
+        let err = cf_error("Not logged in. Use 'cf login'", || "other".to_string());
+        let needs_login = err.downcast_ref::<NeedsLogin>().expect("a NeedsLogin");
+        assert_eq!(needs_login.0, "Not logged in to Cloud Foundry.");
+
+        let err = cf_error("Organization not found", || "cf failed".to_string());
+        assert!(err.downcast_ref::<NeedsLogin>().is_none());
+        assert_eq!(err.to_string(), "cf failed");
+    }
+
+    #[test]
+    fn combined_output_drops_the_bare_failed_line() {
+        let output = |stdout: &str, stderr: &str| std::process::Output {
+            status: Default::default(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(
+            combined_output(&output("  body\n", "\nwarning  ")),
+            "body\nwarning"
+        );
+        assert_eq!(combined_output(&output("FAILED\n", "reason")), "reason");
+        assert_eq!(combined_output(&output("", "")), "");
+    }
+
+    #[test]
+    fn ctrl_is_ctrl_alone() {
+        let key = |modifiers| KeyEvent::new(KeyCode::Char('c'), modifiers);
+        assert!(ctrl(&key(KeyModifiers::CONTROL)));
+        assert!(ctrl(&key(KeyModifiers::CONTROL | KeyModifiers::SHIFT)));
+        // AltGr on Windows.
+        assert!(!ctrl(&key(KeyModifiers::CONTROL | KeyModifiers::ALT)));
+        assert!(!ctrl(&key(KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn cf_config_reads_the_fields_of_config_json() {
+        let json = r#"{
+            "ConfigVersion": 3,
+            "Target": "https://api.example.com",
+            "AuthorizationEndpoint": "https://login.example.com",
+            "AccessToken": "bearer secret",
+            "OrganizationFields": {"GUID": "org-guid", "Name": "org"},
+            "SpaceFields": {"GUID": "space-guid", "Name": "dev", "AllowSSH": true}
+        }"#;
+        let config: CfConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.api, "https://api.example.com");
+        assert_eq!(config.login, "https://login.example.com");
+        assert_eq!(
+            (config.org.guid.as_str(), config.org.name.as_str()),
+            ("org-guid", "org")
+        );
+        assert_eq!(config.space.name, "dev");
+
+        // Without a target, as after `cf api` alone.
+        let config: CfConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.api.is_empty() && config.org.name.is_empty());
+    }
+
+    fn config_with(org: &str, space: &str) -> CfConfig {
+        CfConfig {
+            org: Target {
+                name: org.to_string(),
+                ..Default::default()
+            },
+            space: Target {
+                name: space.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn known_target_prefers_the_current_one() {
+        let favorites = Favorites {
+            orgs: names(&[("fav-org", "Fav")]),
+            targets: BTreeMap::from([("saved-org".to_string(), names(&[("prod", "P")]))]),
+        };
+        let config = config_with("org", "dev");
+        assert_eq!(
+            known_target(&config, Some(&favorites)),
+            Some(("org", Some("dev")))
+        );
+        let config = config_with("org", "");
+        assert_eq!(known_target(&config, Some(&favorites)), Some(("org", None)));
+    }
+
+    #[test]
+    fn known_target_falls_back_to_favorites() {
+        let config = CfConfig::default();
+        let mut favorites = Favorites {
+            orgs: names(&[("fav-org", "Fav")]),
+            targets: BTreeMap::from([("saved-org".to_string(), names(&[("prod", "P")]))]),
+        };
+        assert_eq!(
+            known_target(&config, Some(&favorites)),
+            Some(("saved-org", Some("prod")))
+        );
+        // An org left without spaces is no target.
+        favorites
+            .targets
+            .insert("saved-org".to_string(), BTreeMap::new());
+        assert_eq!(
+            known_target(&config, Some(&favorites)),
+            Some(("fav-org", None))
+        );
+        assert_eq!(known_target(&config, Some(&Favorites::default())), None);
+        assert_eq!(known_target(&config, None), None);
+    }
+
+    /// Points `CF_HOME` at an empty directory of its own for as long as it
+    /// lives. Tests that use it run one at a time, as they share the
+    /// environment.
+    struct TempCfHome {
+        dir: PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TempCfHome {
+        fn new(name: &str) -> Self {
+            static LOCK: Mutex<()> = Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir =
+                std::env::temp_dir().join(format!("cf-ts-test-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::env::set_var("CF_HOME", &dir);
+            TempCfHome { dir, _lock: lock }
+        }
+
+        fn file(&self, name: &str) -> PathBuf {
+            self.dir.join(".cf").join(name)
+        }
+    }
+
+    impl Drop for TempCfHome {
+        fn drop(&mut self) {
+            std::env::remove_var("CF_HOME");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn cf_home_prefers_cf_home() {
+        let home = TempCfHome::new("cf-home");
+        assert_eq!(cf_home(), Some(home.dir.clone()));
+        assert_eq!(favorites_path(), Some(home.file("cf-ts.json")));
+        // Set but empty is the same as not set.
+        std::env::set_var("CF_HOME", "");
+        assert_ne!(cf_home(), Some(PathBuf::new()));
+    }
+
+    #[test]
+    fn favorites_round_trip_through_the_file() {
+        let home = TempCfHome::new("round-trip");
+        assert!(read_favorites().unwrap().is_empty());
+
+        let mut all = AllFavorites::new();
+        let favorites = all.entry("https://api".to_string()).or_default();
+        favorites.orgs = names(&[("org", "Mine")]);
+        favorites
+            .targets
+            .insert("org".to_string(), names(&[("dev", "Dev")]));
+        // Emptied by removing the last name: not to be written.
+        favorites
+            .targets
+            .insert("old-org".to_string(), BTreeMap::new());
+        all.insert("https://other".to_string(), Favorites::default());
+        save_favorites(&mut all).unwrap();
+
+        let read = read_favorites().unwrap();
+        assert_eq!(read.keys().collect::<Vec<_>>(), ["https://api"]);
+        assert_eq!(read["https://api"].orgs, names(&[("org", "Mine")]));
+        assert_eq!(
+            read["https://api"].targets.keys().collect::<Vec<_>>(),
+            ["org"]
+        );
+        // Written in full, and nothing left next to it.
+        assert!(std::fs::read_to_string(home.file("cf-ts.json"))
+            .unwrap()
+            .ends_with("}\n"));
+        assert!(!home.file("cf-ts.json.tmp").exists());
+    }
+
+    #[test]
+    fn load_favorites_moves_an_invalid_file_aside() {
+        let home = TempCfHome::new("invalid");
+        std::fs::create_dir_all(home.file("")).unwrap();
+        std::fs::write(home.file("cf-ts.json"), "{ not json").unwrap();
+
+        assert!(load_favorites().is_empty());
+        assert!(!home.file("cf-ts.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.file("cf-ts.json.bak")).unwrap(),
+            "{ not json"
+        );
+    }
+
+    #[test]
+    fn edit_favorites_keeps_what_was_saved_in_between() {
+        let _home = TempCfHome::new("edit");
+        let mut all = load_favorites();
+
+        // Saved by another cf-ts after this one read the file.
+        let mut other = AllFavorites::new();
+        other.entry("https://api".to_string()).or_default().orgs = names(&[("org-a", "A")]);
+        save_favorites(&mut other).unwrap();
+
+        edit_favorites(&mut all, "https://api", |f| {
+            set_name(&mut f.orgs, "org-b", "B".to_string())
+        })
+        .unwrap();
+        let expected = names(&[("org-a", "A"), ("org-b", "B")]);
+        assert_eq!(all["https://api"].orgs, expected);
+        assert_eq!(read_favorites().unwrap()["https://api"].orgs, expected);
+    }
+
+    #[test]
+    fn spaces_keep_what_was_fetched_ahead() {
+        let mut spaces = Spaces::default();
+        spaces.ahead = Some((
+            "org-guid".to_string(),
+            std::thread::spawn(|| Ok(vec![resource("dev")])),
+        ));
+        // Taken from the fetch, without asking cf.
+        assert_eq!(order(&spaces.of("org-guid").unwrap()), ["dev"]);
+        assert!(spaces.ahead.is_none());
+
+        // A failed fetch is not kept, so that the org is asked for again.
+        spaces.ahead = Some((
+            "other-guid".to_string(),
+            std::thread::spawn(|| bail!("cf curl failed")),
+        ));
+        spaces.settle();
+        assert!(!spaces.fetched.contains_key("other-guid"));
+    }
+
+    #[test]
+    fn spaces_wait_for_the_fetch_when_dropped() {
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let mut spaces = Spaces::default();
+        let flag = done.clone();
+        spaces.ahead = Some((
+            "org-guid".to_string(),
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                flag.store(true, Ordering::SeqCst);
+                Ok(Vec::new())
+            }),
+        ));
+        drop(spaces);
+        assert!(done.load(Ordering::SeqCst));
     }
 }

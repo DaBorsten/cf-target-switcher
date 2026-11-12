@@ -7,6 +7,7 @@
 #   CF_TS_VERSION          release tag to install, e.g. v0.1.0 (default: latest)
 #   CF_TS_INSTALL_DIR      target directory (default: ~/.local/bin)
 #   CF_TS_NO_MODIFY_PATH   set to 1 to leave shell profiles untouched
+#   CF_TS_SKIP_ATTESTATION set to 1 to not verify the build provenance with gh
 
 set -eu
 
@@ -49,14 +50,27 @@ verify_checksum() {
 	elif command -v shasum >/dev/null 2>&1; then
 		sha="shasum -a 256"
 	else
-		say "warning: sha256sum/shasum not found, skipping checksum verification"
-		return
+		err "sha256sum or shasum is required to verify the download"
 	fi
 	fetch "$base/SHA256SUMS.txt" "$tmp/SHA256SUMS.txt" || err "could not download SHA256SUMS.txt"
 	expected=$(grep " \*\{0,1\}$asset\$" "$tmp/SHA256SUMS.txt" | cut -d' ' -f1)
 	[ -n "$expected" ] || err "no checksum found for $asset"
 	actual=$($sha "$tmp/$asset" | cut -d' ' -f1)
 	[ "$expected" = "$actual" ] || err "checksum mismatch for $asset"
+}
+
+# The checksum comes from the same release as the archive, so it only tells
+# that the download is intact. The attestation tells that the archive was
+# built by this repository's release workflow. Checking it takes a GitHub
+# CLI that is logged in, so it is done where there is one.
+verify_attestation() {
+	[ "${CF_TS_SKIP_ATTESTATION:-0}" = 1 ] && return
+	command -v gh >/dev/null 2>&1 || return 0
+	gh attestation verify --help >/dev/null 2>&1 || return 0
+	gh auth status >/dev/null 2>&1 || return 0
+	gh attestation verify "$tmp/$asset" --repo "$REPO" >/dev/null 2>&1 ||
+		err "could not verify the build provenance of $asset (set CF_TS_SKIP_ATTESTATION=1 to install without)"
+	say "Verified build provenance."
 }
 
 ensure_path() {
@@ -112,6 +126,7 @@ main() {
 	say "Downloading $asset ($version)..."
 	fetch "$base/$asset" "$tmp/$asset" || err "download failed: $base/$asset"
 	verify_checksum
+	verify_attestation
 	tar -xzf "$tmp/$asset" -C "$tmp"
 
 	# Copy next to the target, then rename, so a running cf-ts can be replaced.

@@ -1,6 +1,6 @@
 [package]
 name = "cf-ts"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Interactively switch Cloud Foundry org and space"
 license = "MIT"
@@ -13,7 +13,7 @@ categories = ["command-line-utilities"]
 anyhow = "1"
 console = "0.16"
 crossterm = "0.29"
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 fuzzy-matcher = "0.3"
 serde = { version = "1", features = ["derive"] }
